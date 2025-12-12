@@ -35,6 +35,9 @@ def flat_split_train_val_test(
         The duration of gap between training and validation/test sets.
     drop_non_train_items : bool
         Whether to drop items that are not in the training set.
+    deep : int | None
+        If specified, for each user keep only interactions within this time depth 
+        from their last interaction in the training period.
 
     Returns:
     -------
@@ -62,11 +65,40 @@ def flat_split_train_val_test(
 
     df_lazy = df.lazy()
 
+    """
+    # Фильтруем тренировочные данные по временному диапазону v1
     #train = df_lazy.filter(pl.col("timestamp") < train_timestamp)
     if deep is not None:
         train = df_lazy.filter((pl.col("timestamp") < train_timestamp) & (pl.col("timestamp") > train_timestamp - deep))
     else:
         train = df_lazy.filter(pl.col("timestamp") < train_timestamp)
+    """
+
+    # Фильтруем тренировочные данные по временному диапазону v2
+    train_candidates = df_lazy.filter(pl.col("timestamp") < train_timestamp)
+    
+    # Если deep задан, фильтруем данные по глубине для каждого пользователя
+    if deep is not None and deep > 0:
+        # Находим максимальный timestamp для каждого пользователя в тренировочном периоде
+        user_max_timestamp = train_candidates.group_by("uid").agg(
+            pl.col("timestamp").max().alias("max_timestamp")
+        )
+
+        # Присоединяем максимальный timestamp к данным
+        train_candidates = train_candidates.join(
+            user_max_timestamp.lazy(),
+            on="uid",
+            how="left"
+        )
+        
+        # Оставляем только взаимодействия, которые попадают в глубину deep
+        train = train_candidates.filter(
+            pl.when(pl.col("max_timestamp") >= deep)
+            .then(pl.col("timestamp") >= pl.col("max_timestamp") - deep)
+            .otherwise(True)  # если max_timestamp < deep, включаем все записи пользователя
+        ).drop("max_timestamp")
+    else:
+        train = train_candidates
 
     unique_train_uids = train.select("uid").unique().collect(engine=engine)
     unique_train_item_ids = train.select("item_id").unique().collect(engine=engine)
@@ -78,7 +110,6 @@ def flat_split_train_val_test(
                 (pl.col("timestamp") >= test_timestamp - val_size - gap_size)
                 & (pl.col("timestamp") < test_timestamp - gap_size)
             )
-            #
             .with_columns(
                 pl.col("uid").is_in(unique_train_uids.get_column("uid").implode()).alias("uid_in_train")
             )  # to prevent filter reordering
@@ -90,7 +121,6 @@ def flat_split_train_val_test(
 
     test = (
         df_lazy.filter(pl.col("timestamp") >= test_timestamp)
-        #
         .with_columns(
             pl.col("uid").is_in(unique_train_uids.get_column("uid").implode()).alias("uid_in_train")
         )  # to prevent filter reordering
